@@ -326,7 +326,9 @@ def load_recording(path):
                 sources=get('sources', np.array([''] * n)),
                 board_us=get('board_us', np.zeros(n, np.uint32)),
                 seq=get('seq', np.zeros(n, np.uint16)),
-                has_meta=get('has_meta', np.zeros(n, bool)))
+                has_meta=get('has_meta', np.zeros(n, bool)),
+                # HIRO's recorder doesn't store which board (port) a frame came from
+                boards_known='ports' in z)
 
 
 def cmd_record(args):
@@ -352,17 +354,71 @@ def _q(x, p):
     return float(np.percentile(x, p)) if len(x) else float('nan')
 
 
-def analyze(rec):
+PAUSE_S = 1.0          # intervals longer than this (and 10x the median) are recording pauses
+LOCK_MS_PER_S = 0.5    # sensors whose relative phase drifts less than this share a read loop
+LOCK_RESID_MS = 3.0    # ... and whose (2 s averaged) phase wanders less than this around that line
+CHUNK_S = 2.0          # phase is averaged over chunks this long before fitting drift
+
+
+def _phase(ref_t, t):
+    """Phase of frames t after the most recent ref_t frame, and its drift.
+    -> (times, phase s, drift s/s or None, wander s or None)."""
+    if len(ref_t) < 2 or len(t) < 1:
+        return t[:0], t[:0], None, None
+    period = np.median(np.diff(ref_t))
+    j = np.searchsorted(ref_t, t, side='right') - 1
+    ok = j >= 0
+    tt, ph = t[ok], (t[ok] - ref_t[j[ok]]) % period
+    # Drift from the circular mean phase of ~2 s chunks: averages out transport
+    # jitter (Wi-Fi arrival times scatter by several ms) but keeps clock drift.
+    edges = np.arange(tt[0], tt[-1] + CHUNK_S, CHUNK_S)
+    ang = ph / period * 2 * np.pi
+    ct, cp = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        sel = (tt >= a) & (tt < b)
+        if sel.sum() >= 5:
+            ct.append(tt[sel].mean())
+            cp.append(np.angle(np.exp(1j * ang[sel]).mean()))
+    if len(ct) < 3:
+        return tt, ph, None, None
+    cp = np.unwrap(np.array(cp)) / (2 * np.pi) * period
+    fit = np.polyfit(ct, cp, 1)
+    resid = cp - np.polyval(fit, ct)          # robust spread: a Wi-Fi outage scrambles a few chunks
+    return tt, ph, float(fit[0]), float(1.4826 * np.median(np.abs(resid - np.median(resid))))
+
+
+def parse_boards(spec):
+    """'71-74;75,77,81,82' -> [[71, 72, 73, 74], [75, 77, 81, 82]]"""
+    groups = []
+    for g in spec.split(';'):
+        ids = []
+        for part in g.replace(' ', '').split(','):
+            if '-' in part:
+                lo, hi = part.split('-')
+                ids += range(int(lo), int(hi) + 1)
+            elif part:
+                ids.append(int(part))
+        if ids:
+            groups.append(ids)
+    return groups
+
+
+def analyze(rec, boards_spec=None):
     """Per-sensor sampling report. Times are seconds from the first frame.
 
     Board clock (when packets carry it) = when the board read the frame, so its
     intervals are the sensor's own sampling. PC clock = when the frame arrived,
-    so PC intervals = sensor sampling + transport jitter."""
+    so PC intervals = sensor sampling + transport jitter.
+
+    Which board a sensor is on comes from its port/source. Recordings that don't
+    store that (HIRO's .npz) take boards from boards_spec, or are grouped by
+    timing: HIRO's firmware reads its sensors in a fixed loop, so sensors on one
+    board stay phase-locked (drift ~0) while separate boards drift apart."""
     t_pc = (rec['timestamps'].astype(np.int64) - int(rec['timestamps'].min())) / 1e9
-    boards = sorted(set(zip(rec['ports'].tolist(), rec['sources'].tolist())))
+    links = sorted(set(zip(rec['ports'].tolist(), rec['sources'].tolist())))
     # board time on the PC's axis: unwrap per board, then align its start to the PC clock
     t_board = np.full(len(t_pc), np.nan)
-    for port, src in boards:
+    for port, src in links:
         m = (rec['ports'] == port) & (rec['sources'] == src) & rec['has_meta']
         if m.sum() > 1:
             idx = np.flatnonzero(m)
@@ -372,69 +428,98 @@ def analyze(rec):
     t = np.where(np.isfinite(t_board), t_board, t_pc)
 
     keys = sorted(set(zip(rec['ports'].tolist(), rec['sources'].tolist(), rec['sensor_ids'].tolist())))
-    multi = len(boards) > 1
+    multi = len(links) > 1
     sensors = []
     for port, src, sid in keys:
         m = np.flatnonzero((rec['ports'] == port) & (rec['sources'] == src) & (rec['sensor_ids'] == sid))
         ts, tp = t[m], t_pc[m]
         order = np.argsort(ts, kind='stable')
         m, ts, tp = m[order], ts[order], tp[order]
-        dt = np.diff(ts) * 1e3
+        dt_all = np.diff(ts) * 1e3
         dtp = np.diff(np.sort(tp)) * 1e3
-        med = float(np.median(dt)) if len(dt) else float('nan')
+        med = float(np.median(dt_all)) if len(dt_all) else float('nan')
+        pause = dt_all > max(PAUSE_S * 1e3, 10 * med) if len(dt_all) else np.zeros(0, bool)
+        dt = dt_all[~pause]
         r = dict(label=(f'{src or port}:s{sid}' if multi else f's{sid}'), port=port, source=src, sensor=int(sid),
+                 board=f'{src or port}' if multi else None,
                  frames=int(len(m)), clock='board' if np.isfinite(t_board[m]).all() else 'pc',
-                 rate_hz=round((len(ts) - 1) / (ts[-1] - ts[0]), 3) if len(ts) > 1 and ts[-1] > ts[0] else None,
+                 rate_hz=round(len(dt) / (dt.sum() / 1e3), 3) if len(dt) and dt.sum() > 0 else None,
                  interval_ms=dict(mean=round(float(dt.mean()), 2) if len(dt) else None,
                                   median=round(med, 2), std=round(float(dt.std()), 2) if len(dt) else None,
                                   min=round(_q(dt, 0), 2), p99=round(_q(dt, 99), 2), max=round(_q(dt, 100), 2)),
                  pc_interval_std_ms=round(float(dtp.std()), 2) if len(dtp) else None,
                  gaps=int((dt > 1.5 * med).sum()) if len(dt) else 0,
+                 pauses=int(pause.sum()),
                  invalid_pct=round(100 * float((rec['readings_mm'][m] == NO_TARGET).mean()), 1))
         if rec['has_meta'][m].all() and len(m) > 1:
-            s = rec['seq'][m].astype(np.int64)
-            r['lost'] = int(((np.diff(s) % 2**16) - 1).clip(0).sum())
-            sampled = len(m) - 1 + r['lost']                  # frames the sensor made, dropped or not
-            if ts[-1] > ts[0]:
+            steps = (np.diff(rec['seq'][m].astype(np.int64)) % 2**16)[~pause]
+            r['lost'] = int((steps - 1).clip(0).sum())
+            if len(dt) and dt.sum() > 0:      # frames the sensor made, dropped in transport or not
                 r['received_hz'] = r['rate_hz']
-                r['rate_hz'] = round(sampled / (ts[-1] - ts[0]), 3)
+                r['rate_hz'] = round(steps.sum() / (dt.sum() / 1e3), 3)
             lat = (tp - ts) * 1e3
             r['transport_jitter_ms'] = dict(p50=round(_q(lat - lat.min(), 50), 2),
                                             p99=round(_q(lat - lat.min(), 99), 2))
         r['_idx'], r['_t'] = m, ts
         sensors.append(r)
 
+    # which board each sensor is on
+    boards_source = 'port/source'
+    if not rec.get('boards_known', True) and not multi and len(sensors) > 1:
+        if boards_spec:
+            boards_source = '--boards'
+            for b, ids in enumerate(parse_boards(boards_spec), 1):
+                for r in sensors:
+                    if r['sensor'] in ids:
+                        r['board'] = f'b{b}'
+            for r in sensors:
+                r['board'] = r['board'] or 'other'
+        else:
+            boards_source = 'inferred from timing'
+            todo, b = list(sensors), 0
+            while todo:
+                b += 1
+                ref = todo.pop(0)
+                ref['board'] = f'b{b}'
+                for r in list(todo):
+                    _, _, drift, wander = _phase(ref['_t'], r['_t'])
+                    if drift is not None and abs(drift) * 1e3 < LOCK_MS_PER_S and wander * 1e3 < LOCK_RESID_MS:
+                        r['board'] = f'b{b}'
+                        todo.remove(r)
+
     # phase of each sensor against the first sensor on the same board
-    for port, src in boards:
-        group = [r for r in sensors if r['port'] == port and r['source'] == src]
+    for board in dict.fromkeys(r['board'] for r in sensors):
+        group = [r for r in sensors if r['board'] == board]
         ref = group[0]
         for r in group:
-            if len(ref['_t']) < 2 or len(r['_t']) < 1:
+            tt, ph, drift, _ = _phase(ref['_t'], r['_t'])
+            if not len(tt):
                 continue
-            period = np.median(np.diff(ref['_t']))
-            j = np.searchsorted(ref['_t'], r['_t'], side='right') - 1
-            ok = j >= 0
-            ph = (r['_t'][ok] - ref['_t'][j[ok]]) % period
-            r['_phase_t'], r['_phase_ms'] = r['_t'][ok], ph * 1e3
+            r['_phase_t'], r['_phase_ms'] = tt, ph * 1e3
             r['phase_vs'] = ref['label']
-            r['phase_ms_median'] = round(float(np.median(ph)) * 1e3, 2) if ok.any() else None
-            if ok.sum() > 10 and r is not ref:   # drift: unwrapped phase slope = rate difference
-                unwrapped = np.unwrap(ph / period * 2 * np.pi) / (2 * np.pi) * period
-                slope = np.polyfit(r['_t'][ok], unwrapped, 1)[0]
-                r['drift_ms_per_s'] = round(float(slope) * 1e3, 3)
+            r['phase_ms_median'] = round(float(np.median(ph)) * 1e3, 2)
+            if drift is not None and r is not ref:   # drift: unwrapped phase slope = rate difference
+                r['drift_ms_per_s'] = round(drift * 1e3, 3)
     return dict(clock='board' if use_board else 'pc', duration_s=round(float(t.max() - t.min()), 2),
-                frames=int(len(t)), t=t, sensors=sensors)
+                frames=int(len(t)), t=t, sensors=sensors, boards_from=boards_source)
 
 
 def print_report(an):
     print(f"\n{an['frames']} frames over {an['duration_s']} s; timing from the "
           f"{'board clock (sensor sampling)' if an['clock'] == 'board' else 'PC receive clock (includes transport jitter)'}")
-    print(f"{'sensor':>8} {'frames':>6} {'rate Hz':>8} {'interval ms':>12} {'std':>6} {'p99':>6} {'max':>7} "
+    groups = {}
+    for r in an['sensors']:
+        groups.setdefault(r['board'], []).append(r['label'])
+    if len(groups) > 1 or None not in groups:
+        print(f"boards ({an['boards_from']}): " + '   '.join(f"{b}: {' '.join(v)}" for b, v in groups.items()))
+    if any(r['pauses'] for r in an['sensors']):
+        print(f"recording pauses over {PAUSE_S:.0f} s are left out of rates and intervals")
+    print(f"{'sensor':>8} {'board':>5} {'frames':>6} {'rate Hz':>8} {'interval ms':>12} {'std':>6} {'p99':>6} {'max':>7} "
           f"{'gaps':>4} {'lost':>4} {'phase ms':>8} {'drift ms/s':>10} {'PC jit p99':>10} {'invalid%':>8}")
     for r in an['sensors']:
         iv = r['interval_ms']
         f = lambda v, w, p=1: f'{v:{w}.{p}f}' if isinstance(v, (int, float)) and v is not None else f"{'-':>{w}}"
-        print(f"{r['label']:>8} {r['frames']:6d} {f(r['rate_hz'], 8, 2)} {f(iv['mean'], 12, 2)} {f(iv['std'], 6, 2)} "
+        print(f"{r['label']:>8} {r['board'] or '-':>5} {r['frames']:6d} {f(r['rate_hz'], 8, 2)} {f(iv['mean'], 12, 2)} {f(iv['std'], 6, 2)} "
               f"{f(iv['p99'], 6)} {f(iv['max'], 7)} {r['gaps']:4d} {r.get('lost', '-'):>4} "
               f"{f(r.get('phase_ms_median'), 8)} {f(r.get('drift_ms_per_s'), 10, 3)} "
               f"{f((r.get('transport_jitter_ms') or {}).get('p99'), 10)} {r['invalid_pct']:8.1f}")
@@ -453,30 +538,57 @@ def plot_timing(rec, an, path, window_s=1.0):
                          'figure.facecolor': '#fcfcfb', 'axes.facecolor': '#fcfcfb'})
     S = an['sensors']
     n = len(S)
-    col = lambda i: SERIES[i] if i < len(SERIES) else INK2   # >8: identity from labels, not colour
+    boards = list(dict.fromkeys(r['board'] for r in S))
+    by_board = len(boards) > 1
+    # colour = board when there are several boards, else sensor; past 8, identity comes from labels
+    slot = (lambda i: boards.index(S[i]['board'])) if by_board else (lambda i: i)
+    col = lambda i: SERIES[slot(i)] if slot(i) < len(SERIES) else INK2
     cmap = LinearSegmentedColormap.from_list('dist', DIST_RAMP)
     cmap.set_bad(NO_TARGET_COLOR)
     t_all = an['t']
     t0 = t_all.min()
 
-    fig = plt.figure(figsize=(12, 4.2 + 0.6 * n + 4.6))
-    gs = fig.add_gridspec(4 + n, 2, height_ratios=[3.2, 0.9] + [0.55] * n + [0.9, 3.4],
+    bottom = max(3.4, 0.32 * n)
+    fig = plt.figure(figsize=(12, 4.2 + 0.6 * n + 1.2 + bottom))
+    gs = fig.add_gridspec(4 + n, 2, height_ratios=[3.2, 0.9] + [0.55] * n + [0.9, bottom],
                           hspace=0.3, wspace=0.42)
     fig.suptitle(f"VL53L5CX skin: {n} sensor(s), {an['duration_s']} s, timing from the "
                  f"{'board clock' if an['clock'] == 'board' else 'PC receive clock'}",
                  x=0.06, ha='left', fontsize=12, color=INK)
 
-    # A: nearest valid distance per sensor over time
+    # A: nearest valid distance over time, per sensor (one board) or per board (several)
     ax = fig.add_subplot(gs[0, :])
-    for i, r in enumerate(S):
+
+    def nearest(r):
         mm = rec['readings_mm'][r['_idx']].astype(float)
-        mm[mm == NO_TARGET] = np.nan
-        near = np.nanmin(np.where(np.isnan(mm), np.inf, mm), axis=1)
+        mm[mm == NO_TARGET] = np.inf
+        near = mm.min(axis=1)
         near[np.isinf(near)] = np.nan
-        ax.plot(r['_t'] - t0, near, lw=1.5, color=col(i), label=f"{r['label']}  {r['rate_hz'] or 0:.2f} Hz")
+        return r['_t'] - t0, near
+
+    if by_board:
+        for b, board in enumerate(boards):
+            members = [r for r in S if r['board'] == board]
+            tt = np.concatenate([nearest(r)[0] for r in members])
+            nn = np.concatenate([nearest(r)[1] for r in members])
+            order = np.argsort(tt)
+            tt, nn = tt[order], nn[order]
+            # nearest across the board's sensors, over each ~1 frame period
+            step = float(np.median([np.median(np.diff(r['_t'])) for r in members]))
+            bins = np.floor(tt / step).astype(int)
+            ub, first = np.unique(bins, return_index=True)
+            mins = np.fmin.reduceat(nn, first)
+            rate = np.mean([r['rate_hz'] or 0 for r in members])
+            ax.plot(ub * step, mins, lw=1.5, color=SERIES[b] if b < len(SERIES) else INK2,
+                    label=f"{board}: {' '.join(r['label'] for r in members)}  ~{rate:.2f} Hz")
+        ax.set_title('Nearest valid zone per board over time', loc='left')
+        ax.legend(ncol=1, frameon=False, loc='upper right', fontsize=8)
+    else:
+        for i, r in enumerate(S):
+            ax.plot(*nearest(r), lw=1.5, color=col(i), label=f"{r['label']}  {r['rate_hz'] or 0:.2f} Hz")
+        ax.set_title('Nearest valid zone per sensor over time', loc='left')
+        ax.legend(ncol=min(n, 4), frameon=False, loc='upper right', fontsize=8)
     ax.set_ylabel('nearest target (mm)')
-    ax.set_title('Nearest valid zone per sensor over time', loc='left')
-    ax.legend(ncol=min(n, 4), frameon=False, loc='upper right', fontsize=8)
     ax.set_xlim(0, an['duration_s'])
     ax.set_xlabel('time (s)')
     hx = fig.add_subplot(gs[1, :]); hx.axis('off')      # spacer that holds the kymograph title
@@ -493,7 +605,8 @@ def plot_timing(rec, an, path, window_s=1.0):
         edges = np.concatenate([tt, [tt[-1] + (np.median(np.diff(tt)) if len(tt) > 1 else 0.07)]])
         kx.pcolormesh(edges, np.arange(ZONES + 1), mm, cmap=cmap, norm=norm, shading='flat', rasterized=True)
         kx.set_yticks([]); kx.grid(False)
-        kx.set_ylabel(r['label'], rotation=0, ha='right', va='center', color=INK)
+        kx.set_ylabel(r['label'] + (f" ({r['board']})" if by_board else ''), rotation=0, ha='right',
+                      va='center', color=INK)
         kx.tick_params(labelbottom=(i == n - 1))
     cax = hx.inset_axes([0.72, 0.35, 0.28, 0.3])
     cb = fig.colorbar(plt.cm.ScalarMappable(norm, cmap), cax=cax, orientation='horizontal')
@@ -509,7 +622,8 @@ def plot_timing(rec, an, path, window_s=1.0):
             continue
         cx.scatter(dt, i + rng.uniform(-0.25, 0.25, len(dt)), s=8, color=col(i), alpha=0.35, lw=0)
         cx.plot([np.median(dt)] * 2, [i - 0.38, i + 0.38], color=INK, lw=2)
-    cx.set_yticks(range(n), [f"{r['label']}\n{r['interval_ms']['mean']:.1f}±{r['interval_ms']['std']:.1f} ms"
+    sep = '  ' if n > 6 else '\n'
+    cx.set_yticks(range(n), [f"{r['label']}{sep}{r['interval_ms']['mean']:.1f}±{r['interval_ms']['std']:.1f} ms"
                              for r in S], fontsize=8)
     cx.invert_yaxis()
     cx.set_xlabel('interval between frames (ms); bar = median')
@@ -523,13 +637,14 @@ def plot_timing(rec, an, path, window_s=1.0):
             continue
         period_ms = period_ms or float(np.median(np.diff(next(q for q in S if q['label'] == r['phase_vs'])['_t']))) * 1e3
         drift = f"  {r['drift_ms_per_s']:+.1f} ms/s" if 'drift_ms_per_s' in r else ''
-        dx.scatter(r['_phase_t'] - t0, r['_phase_ms'], s=5, color=col(i), lw=0, label=f"{r['label']}{drift}")
+        vs = f" vs {r['phase_vs']}" if r['phase_vs'] != S[0]['label'] else ''
+        dx.scatter(r['_phase_t'] - t0, r['_phase_ms'], s=5, color=col(i), lw=0, label=f"{r['label']}{vs}{drift}")
     if period_ms:
         dx.set_ylim(0, period_ms)
-    dx.set_ylabel(f"ms after {S[0]['label']}'s frame")
+    dx.set_ylabel("ms after its board's first sensor")
     dx.set_xlabel('time (s)')
     dx.legend(frameon=False, fontsize=8, loc='upper left', bbox_to_anchor=(1.0, 1.0), markerscale=2.5)
-    dx.set_title(f"Phase vs {S[0]['label']} over time\n(flat = in step; sawtooth = clock drift)", loc='left')
+    dx.set_title("Phase vs the first sensor on the same board\n(flat = in step; sawtooth = clock drift)", loc='left')
     cx.set_title('Sampling interval per sensor\n(dots = frames; gaps at 2x = lost frames)', loc='left')
 
     fig.savefig(path, dpi=110, bbox_inches='tight')
@@ -549,10 +664,11 @@ def cmd_timing(args):
         print(f'[timing] only {len(rec["timestamps"])} frames: nothing to analyse '
               f'(see README "Troubleshooting")', file=sys.stderr)
         return 1
-    an = analyze(rec)
+    an = analyze(rec, args.boards)
     if args.json:
         clean = [{k: v for k, v in r.items() if not k.startswith('_')} for r in an['sensors']]
         print(json.dumps({'clock': an['clock'], 'duration_s': an['duration_s'], 'frames': an['frames'],
+                          'boards_from': an['boards_from'],
                           'sensors': clean}, indent=2))
     else:
         print_report(an)
@@ -706,6 +822,8 @@ def main(argv=None):
     p.add_argument('--out', metavar='NPZ', help='also save the captured frames')
     p.add_argument('--save', metavar='PNG', help='write the figure')
     p.add_argument('--json', action='store_true', help='machine-readable report')
+    p.add_argument('--boards', metavar='SPEC', help="which sensors share a board, for recordings that don't "
+                   'store it (HIRO .npz), e.g. "71-74;75,77,81,82;76,78-80". Default: inferred from timing')
     p.set_defaults(fn=cmd_timing)
 
     p = sub.add_parser('fake', help='send synthetic frames (test without hardware)')

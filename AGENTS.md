@@ -143,6 +143,11 @@ If rates sit near 13 Hz with many `gaps` but `lost` 0, the board's reads are too
 check that `build_opt.h` is in the sketch folder and the heartbeat's `read_ms` is about 3 ms
 (about 19 ms without it).
 
+HIRO recordings (`raw_data_*.npz`, or `hiro_udp record` output) work with
+`timing --from <file>`. Boards are inferred from timing because those files
+don't store them. Check the `boards (...)` line, and pass `--boards` if a short
+recording leaves sensors ungrouped.
+
 ## Step 7: Visualise / record
 
 ```bash

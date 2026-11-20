@@ -52,6 +52,27 @@ def test_timing_analysis():
     assert abs(s1['drift_ms_per_s'] - 1000 * 0.01 / 1.01) < 0.5   # slower sensor drifts later: ~ +9.9 ms/s
 
 
+def test_board_inference_hiro_style():
+    # HIRO-style recording: PC clock only, no ports. Two boards, each reading its
+    # sensors in a locked loop 20 ms apart; the boards' clocks differ by 0.3%.
+    rng = np.random.default_rng(1)
+    rec = {k: [] for k in ('timestamps', 'sensor_ids', 'readings_mm')}
+    for sid, (period, offset) in {71: (0.081, 0), 72: (0.081, 0.02), 75: (0.081 * 1.003, 0.005),
+                                  77: (0.081 * 1.003, 0.025)}.items():
+        for k in range(1500):
+            t = offset + k * period + rng.normal(0, 0.005)        # Wi-Fi arrival jitter
+            rec['timestamps'].append(int(1e18 + t * 1e9)); rec['sensor_ids'].append(sid)
+            rec['readings_mm'].append(np.full(64, 500))
+    n = len(rec['timestamps'])
+    rec = {k: np.array(v) for k, v in rec.items()}
+    rec.update(ports=np.zeros(n, np.uint16), sources=np.array([''] * n), board_us=np.zeros(n, np.uint32),
+               seq=np.zeros(n, np.uint16), has_meta=np.zeros(n, bool), boards_known=False)
+    an = tof.analyze(rec)
+    board = {r['sensor']: r['board'] for r in an['sensors']}
+    assert board[71] == board[72] != board[75] == board[77], board
+    assert tof.analyze(rec, '71,75;72,77')['boards_from'] == '--boards'
+
+
 def test_rays():
     r = tof.zone_rays()
     assert r.shape == (64, 3) and np.allclose(np.linalg.norm(r, axis=1), 1)
@@ -73,5 +94,5 @@ def test_fake_board_end_to_end():
 
 
 if __name__ == '__main__':
-    test_roundtrip(); test_meta_trailer(); test_timing_analysis(); test_rays(); test_fake_board_end_to_end()
+    test_roundtrip(); test_meta_trailer(); test_timing_analysis(); test_board_inference_hiro_style(); test_rays(); test_fake_board_end_to_end()
     print('all tests passed')

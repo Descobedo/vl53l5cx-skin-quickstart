@@ -168,6 +168,34 @@ The figure above is that board: 30 s, 1,794 frames.
 - **Transport jitter:** about 2 ms p99 over USB serial. Over Wi-Fi it's
   larger: measure it with `timing` (the `PC jit p99` column).
 
+### HIRO recordings
+
+`timing --from` also reads HIRO's `raw_data_*.npz` recordings and the `.npz`
+files from `hiro_udp record`:
+
+```bash
+python tools/tof.py timing --from raw_data_20260819_141533.npz --save hiro.png
+```
+
+HIRO's firmware sends no board clock, so timing uses the PC receive time,
+which includes Wi-Fi jitter. Its recorder also doesn't store which board a
+frame came from. `timing` works that out from the data: HIRO's firmware reads
+a board's sensors in a fixed loop, so sensors on one board stay locked
+together, while separate boards drift apart. On the HIRO chest recordings this
+recovers the three boards exactly (`71–74`, `75/77/81/82`, `76/78/79/80`).
+Recordings under ~6 s are too short to tell. Name the boards yourself with
+`--boards "71-74;75,77,81,82;76,78-80"`. Pauses over 1 s, such as Wi-Fi outages,
+are left out of the rates.
+
+![Timing figure for a HIRO chest recording: three boards, 12 sensors](docs/timing_hiro_chest.png)
+
+**What all 11 HIRO recordings show:** every board runs at **about 12.3 Hz**
+(4 sensors) or **10.5 Hz** (5 sensors), never 15. Sensors on a board land
+about 20 ms apart, the same per-read time this repo's firmware measured before
+`build_opt.h`. So 4 × 20 ms = 81 ms per round (12.3 Hz), and 5 × 19 ms = 95 ms
+(10.5 Hz). The skins are limited by the board's I2C reads, not by the sensors.
+Turning off the unused outputs, as `build_opt.h` does, would bring them to 15 Hz.
+
 ## 6. Use it in your own code
 
 [`examples/minimal_receiver.py`](examples/minimal_receiver.py) is about 20 lines
