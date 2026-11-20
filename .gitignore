@@ -1,0 +1,6 @@
+firmware/**/config.h
+__pycache__/
+*.pyc
+*.npz
+build/
+.pytest_cache/
