@@ -80,24 +80,36 @@ class Hand:
         self.ignored = {}         # key -> reason
         self.last = {}            # key -> latest (64,) mm
         self.t_calib_end = None
+        self.done = False
 
     def start_calibration(self):
+        """The clock starts at the first frame, so a board that is still booting doesn't eat it."""
         self.calib, self.baseline, self.forward, self.ignored = {}, {}, [], {}
-        self.t_calib_end = time.monotonic() + self.args.calib
+        self.t_calib_end, self.done = None, False
+
+    @property
+    def waiting(self):
+        return not self.done and self.t_calib_end is None
 
     @property
     def calibrating(self):
-        return self.t_calib_end is not None and time.monotonic() < self.t_calib_end
+        return not self.done and self.t_calib_end is not None
 
     def add(self, f):
         k = (f.port, f.sensor)
         mm = f.mm.astype(float)
         mm[mm == tof.NO_TARGET] = tof.FIRMWARE_NO_TARGET_MM
         self.last[k] = mm
-        if self.calibrating:
+        if self.done:
+            return
+        now = time.monotonic()
+        if self.t_calib_end is None:
+            self.t_calib_end = now + self.args.calib
+        if now < self.t_calib_end:
             self.calib.setdefault(k, []).append(mm)
-        elif self.t_calib_end is not None and not self.baseline:
+        else:
             self.finish_calibration()
+            self.done = True
 
     def finish_calibration(self):
         keys = sorted(self.calib, key=str)
@@ -188,7 +200,7 @@ def main():
             return False
         for f in got:
             hand.add(f)
-        if hand.calibrating or not hand.baseline:
+        if not hand.done:
             synth.target_amp = 0.0
             return True
         est = hand.estimate()
@@ -219,7 +231,7 @@ def main():
             if not update():
                 break
             synth.render(441)                                   # keep the synth state moving
-            if time.monotonic() - last_print > 0.25 and hand.baseline:
+            if time.monotonic() - last_print > 0.25 and hand.done:
                 last_print = time.monotonic()
                 d = f"{state['dist']:.0f} mm" if state['dist'] else '   -   '
                 print(f"note {midi_name(state['note']) if state['note'] else '-':>4}  vol {state['vol']:.2f}  "
@@ -258,12 +270,17 @@ def main():
     def tick():
         if not update() or (args.seconds and time.monotonic() - state['t0'] > args.seconds):
             return quit_()
-        if hand.calibrating:
-            cv.itemconfigure(note_txt, text='hands away')
-            cv.itemconfigure(info_txt, text=f'learning the background ... {hand.t_calib_end - time.monotonic():.1f} s')
-        elif not hand.baseline:
+        if hand.waiting:
             cv.itemconfigure(note_txt, text='no data')
-            cv.itemconfigure(info_txt, text=f"waiting for frames on {args.serial or 'ports ' + args.ports}")
+            cv.itemconfigure(info_txt, text=f"waiting for frames on {args.serial or 'ports ' + args.ports}"
+                                            " (a board just plugged in takes ~6 s)")
+        elif hand.calibrating:
+            cv.itemconfigure(note_txt, text='hands away')
+            cv.itemconfigure(info_txt, text=f'learning the background ... '
+                                            f'{max(0.0, hand.t_calib_end - time.monotonic()):.1f} s')
+        elif not hand.forward:
+            cv.itemconfigure(note_txt, text='no forward sensors')
+            cv.itemconfigure(info_txt, text='every sensor sees a surface: press c to recalibrate, or use --sensors')
         else:
             playing = state['vol'] > 0.01 and state['note'] is not None
             cv.itemconfigure(note_txt, text=midi_name(state['note']) if playing else '·')
