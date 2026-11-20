@@ -259,9 +259,11 @@ Keep your hands away for the first 2 s while it learns the background. Then
 the closer your hand, the louder, and its left-right position across the
 forward-facing sensors picks the note (pentatonic, so it always sounds fine).
 Sensors that see a surface in most zones, like one facing a table, are ignored
-automatically. Name the forward sensors yourself with `--sensors 0 1 2`. Keys:
+automatically. One facing sideways into open space can't be detected, and it
+takes a slice of the note range your hand never reaches, so name the forward
+sensors left to right yourself: `--sensors 0 1 2`. Keys:
 `c` recalibrate, `f` flip pitch direction, `q` quit.
-Tuning: `--far-mm` (default 250) is where sound starts, `--x-range 0.15 0.85` is
+Tuning: `--far-mm` (default 250) is where sound starts, `--x-range 0.15 0.80` is
 the part of the side-to-side field that spans all the notes, and `--smooth`,
 `--glide` and `--fade` (seconds) set how smoothly position, pitch and volume
 follow your hand.

@@ -8,6 +8,10 @@ Keep your hands away for the first 2 s: it learns what every zone normally sees.
 Sensors that see something close in most zones (e.g. one facing the table) are ignored,
 and so is anything that was already there. Only things closer than that background count.
 
+A sensor that faces sideways into open space can't be told apart automatically, and it
+takes a slice of the note range your hand never reaches (the top notes, if it's last).
+Name the forward sensors, left to right, with --sensors (e.g. --sensors 0 1 2).
+
 Pitch comes from where the hand is across the forward sensors, left to right (sensor
 order, then zone column), snapped to a pentatonic scale. --flip reverses it if it feels
 backwards on your mounting. Keys in the window: c = recalibrate, f = flip, q = quit.
@@ -138,12 +142,14 @@ class Hand:
         if not n:
             return None
         ds, xs = [], []
+        self.fg_counts = {}
         for i, k in enumerate(self.forward):
             if k not in self.last:
                 continue
             mm, base = self.last[k], self.baseline[k]
             fg = (mm < tof.FIRMWARE_NO_TARGET_MM) & (mm < base - np.maximum(self.args.margin_mm, 0.1 * base)) \
                 & (mm < self.args.far_mm)
+            self.fg_counts[k[1]] = int(fg.sum())
             if not fg.any():
                 continue
             z = np.flatnonzero(fg)
@@ -172,7 +178,7 @@ def main():
     ap.add_argument('--flip', action='store_true', help='reverse the pitch direction')
     ap.add_argument('--near-mm', type=float, default=40, help='full volume at this distance')
     ap.add_argument('--far-mm', type=float, default=250, help='silent beyond this distance (start playing inside it)')
-    ap.add_argument('--x-range', type=float, nargs=2, default=[0.15, 0.85], metavar=('LO', 'HI'),
+    ap.add_argument('--x-range', type=float, nargs=2, default=[0.15, 0.80], metavar=('LO', 'HI'),
                     help='part of the side-to-side field (0..1) that spans all the notes; '
                          'narrower = the end notes are easier to reach')
     ap.add_argument('--smooth', type=float, default=0.15, help='seconds of smoothing on hand position and distance')
@@ -248,8 +254,10 @@ def main():
             if time.monotonic() - last_print > 0.25 and hand.done:
                 last_print = time.monotonic()
                 d = f"{state['dist']:.0f} mm" if state['dist'] else '   -   '
+                fg = ' '.join(f's{k}:{v:2d}' for k, v in getattr(hand, 'fg_counts', {}).items())
                 print(f"note {midi_name(state['note']) if state['note'] else '-':>4}  vol {state['vol']:.2f}  "
-                      f"hand {d}  x {state['x'] if state['x'] is not None else float('nan'):.2f}")
+                      f"hand {d}  x {state['x'] if state['x'] is not None else float('nan'):.2f}   hand zones {fg}",
+                      flush=True)
             time.sleep(0.01)
         return 0
 
