@@ -3,7 +3,8 @@
 
     python tools/tof.py status                 # rate / nearest / invalid % per sensor (text)
     python tools/tof.py status --seconds 5 --json
-    python tools/tof.py view                   # live 8x8 heatmaps, one panel per sensor
+    python tools/tof.py live                   # fast live 8x8 view (Tk, nothing to install)
+    python tools/tof.py view                   # live 8x8 heatmaps in matplotlib (slower)
     python tools/tof.py record run1.npz --seconds 60
     python tools/tof.py timing --seconds 20 --save timing.png   # data over time + sampling report
     python tools/tof.py timing --from run1.npz --save timing.png
@@ -145,10 +146,10 @@ def _make_frame(t_ns, port, data, source):
     return Frame(t_ns, port, p[0], p[1], p[2], data, source, us, seq)
 
 
-def _udp_frames(args, end):
+def _udp_frames(args, end, idle=0.2):
     socks = open_sockets(parse_ports(args.ports), args.iface, not args.no_multicast)
     while end is None or time.monotonic() < end:
-        timeout = 0.2 if end is None else max(0.0, min(0.2, end - time.monotonic()))
+        timeout = idle if end is None else max(0.0, min(idle, end - time.monotonic()))
         ready, _, _ = select.select(socks, [], [], timeout)
         if not ready:
             yield None
@@ -164,7 +165,7 @@ def _udp_frames(args, end):
                     yield f
 
 
-def _serial_frames(args, end):
+def _serial_frames(args, end, idle=0.2):
     try:
         import serial
     except ImportError:
@@ -176,6 +177,9 @@ def _serial_frames(args, end):
     buf = bytearray()
     text = bytearray()
     while end is None or time.monotonic() < end:
+        if idle == 0 and ser.in_waiting == 0:      # non-blocking: hand control back at once
+            yield None
+            continue
         chunk = ser.read(max(1, ser.in_waiting))   # return as soon as bytes arrive
         t_ns = time.time_ns()
         if not chunk:
@@ -209,12 +213,28 @@ def _serial_frames(args, end):
                 print('[board]', line.decode('utf-8', 'replace').rstrip(), file=sys.stderr)
 
 
-def frames(args):
-    """Yield Frame tuples (or None when idle) forever / until --seconds."""
+def frames(args, idle=0.2):
+    """Yield Frame tuples (or None when idle) forever / until --seconds.
+    idle: how long to wait for data before yielding None. 0 = never block (viewers)."""
     end = time.monotonic() + args.seconds if getattr(args, 'seconds', None) else None
     if getattr(args, 'serial', None):
-        return _serial_frames(args, end)
-    return _udp_frames(args, end)
+        return _serial_frames(args, end, idle)
+    return _udp_frames(args, end, idle)
+
+
+def drain(gen, budget_s=0.01):
+    """Pull every frame that is already waiting (up to budget_s), never blocking.
+    -> list of frames, or None when the source has ended."""
+    out, t_end = [], time.monotonic() + budget_s
+    while time.monotonic() < t_end:
+        try:
+            f = next(gen)
+        except StopIteration:
+            return out or None
+        if f is None:
+            break
+        out.append(f)
+    return out
 
 
 class Stats:
@@ -680,6 +700,24 @@ def cmd_timing(args):
 
 # -- live view ---------------------------------------------------------------------
 
+class RenderMeter:
+    """Counts redraws and how stale the shown data was (render time - receive time)."""
+
+    def __init__(self):
+        self.t0, self.draws, self.lags = time.monotonic(), 0, []
+
+    def drew(self, newest_t_ns):
+        self.draws += 1
+        if newest_t_ns:
+            self.lags.append((time.time_ns() - newest_t_ns) / 1e6)
+
+    def report(self, name):
+        dt = max(time.monotonic() - self.t0, 1e-6)
+        lag = np.array(self.lags[len(self.lags) // 10:] or [np.nan])   # skip the warm-up
+        print(f'[{name}] {self.draws / dt:.0f} redraws/s, display lag p50 {np.median(lag):.0f} ms, '
+              f'p95 {np.percentile(lag, 95):.0f} ms', file=sys.stderr)
+
+
 def cmd_view(args):
     import matplotlib
     if args.save:
@@ -687,14 +725,25 @@ def cmd_view(args):
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap, Normalize
 
-    st = Stats()
-    panels = {}
-    plt.ion()
+    st, meter = Stats(), RenderMeter()
+    panels, newest = {}, {}
     fig = plt.figure('VL53L5CX skin', figsize=(10, 6))
+    closed = []
+    fig.canvas.mpl_connect('close_event', lambda e: closed.append(True))
     cmap = LinearSegmentedColormap.from_list('dist', DIST_RAMP)
     cmap.set_bad(NO_TARGET_COLOR)
     norm = Normalize(0, args.max_mm)
-    gen = frames(args)
+    gen = frames(args, idle=0)
+    # Blitting: the axes, colourbar and frame are drawn once; each update repaints only
+    # the images and text (~3x faster than a full matplotlib redraw).
+    blit = not args.save
+    bg = []
+    if args.numbers:
+        print('[view] --numbers is slow in matplotlib (it redraws 64 labels per sensor); '
+              '`tof.py live --numbers` is much faster', file=sys.stderr)
+
+    def grab_background(_=None):
+        bg[:] = [fig.canvas.copy_from_bbox(fig.bbox)]
 
     def relayout():
         fig.clf()
@@ -703,52 +752,209 @@ def cmd_view(args):
         rows = math.ceil(len(keys) / cols)
         for i, k in enumerate(keys):
             ax = fig.add_subplot(rows, cols, i + 1)
-            im = ax.imshow(np.full((8, 8), np.nan), cmap=cmap, norm=norm)
+            im = ax.imshow(np.full((8, 8), np.nan), cmap=cmap, norm=norm, interpolation='nearest', animated=blit)
             ax.set_xticks([]); ax.set_yticks([])
-            txt = [[ax.text(c, r, '', ha='center', va='center', fontsize=6, color='w')
+            title = ax.text(0, 1.03, f'{k[0]}  s{k[1]}', transform=ax.transAxes, fontsize=8, va='bottom',
+                            animated=blit)
+            txt = [[ax.text(c, r, '', ha='center', va='center', fontsize=6, color='w', animated=blit)
                     for c in range(8)] for r in range(8)] if args.numbers else None
-            panels[k] = (ax, im, txt)
+            panels[k] = (ax, im, txt, title)
         cb = fig.colorbar(plt.cm.ScalarMappable(norm, cmap), ax=fig.axes, label='distance (mm)', shrink=0.8)
         cb.outline.set_visible(False)
+        if blit:
+            fig.canvas.draw()
+            grab_background()
 
+    if blit:
+        fig.canvas.mpl_connect('resize_event', lambda e: (fig.canvas.draw(), grab_background()))
+
+    if not args.save:
+        plt.show(block=False)
     print('[view] waiting for frames... close the window to quit')
-    last_draw = 0.0
+    last_draw = last_titles = 0.0
     t_end = time.monotonic() + (args.seconds or (5 if args.save else float('inf')))
-    while plt.fignum_exists(fig.number) and time.monotonic() < t_end:
+    while not closed and time.monotonic() < t_end:
+        got = drain(gen)                       # everything waiting, never blocks
+        if got is None:
+            break
         new = False
-        for _ in range(500):
-            f = next(gen, None)
-            if f is None:
-                break
+        for f in got:
             k = (f.port, f.sensor)
             if k not in panels:
                 panels[k] = None
                 new = True
             st.add(f.port, f.sensor, f.mm, f.source)
+            newest[k] = f.t_ns
         if new:
             relayout()
-        if time.monotonic() - last_draw > 1 / 30 and panels:
-            last_draw = time.monotonic()
-            for r in st.rows():
+        now = time.monotonic()
+        if got and panels and now - last_draw > 1 / 30:
+            last_draw = now
+            titles = now - last_titles > 0.5    # text layout is slow: titles twice a second
+            if titles:
+                last_titles = now
+            for r in st.rows() if titles else [dict(port=k[0], sensor=k[1]) for k in st.last]:
                 k = (r['port'], r['sensor'])
-                ax, im, txt = panels[k]
+                ax, im, txt, title = panels[k]
                 mm = st.last[k].astype(float).reshape(8, 8)
                 mm[mm == NO_TARGET] = np.nan
                 im.set_data(mm)
-                near = f"{r['nearest_mm']} mm" if r['nearest_mm'] is not None else 'none'
-                ax.set_title(f"{k[0]}  s{k[1]}\n{r['hz']:.1f} Hz  near {near}", fontsize=8)
+                if titles:
+                    near = f"{r['nearest_mm']} mm" if r['nearest_mm'] is not None else 'none'
+                    title.set_text(f"{k[0]}  s{k[1]}\n{r['hz']:.1f} Hz  near {near}")
                 if txt:
                     for z in range(ZONES):
                         v = mm.flat[z]
                         txt[z // 8][z % 8].set_text('' if np.isnan(v) else f'{v:.0f}')
+            if blit and bg:
+                fig.canvas.restore_region(bg[0])
+                for ax, im, txt, title in panels.values():
+                    ax.draw_artist(im)
+                    ax.draw_artist(title)
+                    for row in txt or []:
+                        for t in row:
+                            ax.draw_artist(t)
+                fig.canvas.blit(fig.bbox)
+            meter.drew(max(newest.values()))
         if args.save:
-            time.sleep(0.01)
+            time.sleep(0.005)
         else:
-            plt.pause(0.01)
+            fig.canvas.flush_events()          # far cheaper than plt.pause()
+            time.sleep(0.005)
+    meter.report('view')
     if args.save:
+        fig.canvas.draw()
         fig.savefig(args.save, dpi=110, bbox_inches='tight')
         print(f'[view] {len(panels)} sensor panel(s) -> {args.save}')
         return 0 if panels else 1
+    if not closed:
+        plt.close(fig)
+    return 0
+
+
+def _ramp_lut(n=256):
+    """n hex colours along DIST_RAMP (index 0 = 0 mm)."""
+    rgb = np.array([[int(h[i:i + 2], 16) for i in (1, 3, 5)] for h in DIST_RAMP], float)
+    x = np.linspace(0, 1, len(DIST_RAMP))
+    q = np.linspace(0, 1, n)
+    cols = np.stack([np.interp(q, x, rgb[:, c]) for c in range(3)], 1).round().astype(int)
+    return ['#%02x%02x%02x' % tuple(c) for c in cols]
+
+
+def cmd_live(args):
+    """Light live viewer: one Tk canvas of coloured cells (no matplotlib, nothing to install).
+    Keys: n = numbers on/off, + / - = colour range, q / Esc = quit."""
+    import tkinter as tk
+
+    CELL, GAP, HEAD = args.cell, 2, 34
+    lut = _ramp_lut()
+    st, meter = Stats(), RenderMeter()
+    gen = frames(args, idle=0)
+    state = dict(max_mm=float(args.max_mm), numbers=args.numbers, last_titles=0.0, dirty=set(), newest={})
+    panels = {}   # key -> dict(rects, texts, title, last colour indices)
+
+    root = tk.Tk()
+    root.title('VL53L5CX skin (live)')
+    root.configure(bg='#fcfcfb')
+    canvas = tk.Canvas(root, bg='#fcfcfb', highlightthickness=0, width=4 * (8 * CELL + 24), height=8 * CELL + HEAD + 40)
+    canvas.pack(fill='both', expand=True)
+    status = canvas.create_text(8, 8, anchor='nw', fill=INK2, font=('Segoe UI', 9),
+                                text=f'waiting for frames on {_where(args)} ...   keys: n numbers, +/- range, q quit')
+
+    def add_panel(new_key):
+        """Lay every panel out again in sorted order (only when a new sensor appears)."""
+        for p in panels.values():
+            canvas.delete(*p['rects'], *p['texts'], p['title'])
+        keys = sorted(list(panels) + [new_key], key=str)
+        panels.clear()
+        for i, k in enumerate(keys):
+            col, row = i % args.cols, i // args.cols
+            x0 = 12 + col * (8 * CELL + 24)
+            y0 = 28 + row * (8 * CELL + HEAD + 16) + HEAD
+            rects, texts = [], []
+            for z in range(ZONES):
+                r, c = divmod(z, 8)
+                x, y = x0 + c * CELL, y0 + r * CELL
+                rects.append(canvas.create_rectangle(x, y, x + CELL - GAP, y + CELL - GAP, width=0,
+                                                     fill=NO_TARGET_COLOR))
+                texts.append(canvas.create_text(x + (CELL - GAP) / 2, y + (CELL - GAP) / 2, text='', fill='white',
+                                                font=('Segoe UI', max(6, CELL // 5))))
+            title = canvas.create_text(x0, y0 - 6, anchor='sw', fill=INK, font=('Segoe UI', 9), text=f'{k[0]}  s{k[1]}')
+            panels[k] = dict(rects=rects, texts=texts, title=title, idx=[None] * ZONES, txt=[None] * ZONES)
+            if k in st.last:
+                state['dirty'].add(k)
+        w = 24 + min(len(panels), args.cols) * (8 * CELL + 24)
+        h = 28 + math.ceil(len(panels) / args.cols) * (8 * CELL + HEAD + 16) + 8
+        canvas.config(width=w, height=h)
+
+    def draw_panel(k):
+        p, mm = panels[k], st.last[k]
+        scale = (len(lut) - 1) / state['max_mm']
+        for z in range(ZONES):
+            v = int(mm[z])
+            idx = -1 if v == NO_TARGET else min(int(v * scale), len(lut) - 1)
+            if idx != p['idx'][z]:                       # only touch cells that changed colour
+                p['idx'][z] = idx
+                canvas.itemconfigure(p['rects'][z], fill=NO_TARGET_COLOR if idx < 0 else lut[idx])
+            t = (str(v) if v != NO_TARGET else '') if state['numbers'] else ''
+            if t != p['txt'][z]:
+                p['txt'][z] = t
+                canvas.itemconfigure(p['texts'][z], text=t, fill='white' if 0 <= idx < len(lut) * 0.55 else INK)
+
+    def tick():
+        got = drain(gen)
+        if got is None:
+            return finish()
+        for f in got:
+            k = (f.port, f.sensor)
+            if k not in panels:
+                add_panel(k)
+            st.add(f.port, f.sensor, f.mm, f.source)
+            state['dirty'].add(k)
+            state['newest'][k] = f.t_ns
+        if state['dirty']:
+            for k in state['dirty']:
+                draw_panel(k)
+            meter.drew(max(state['newest'][k] for k in state['dirty']))
+            state['dirty'].clear()
+        now = time.monotonic()
+        if now - state['last_titles'] > 0.5 and panels:
+            state['last_titles'] = now
+            for r in st.rows():
+                near = f"{r['nearest_mm']} mm" if r['nearest_mm'] is not None else 'none'
+                canvas.itemconfigure(panels[(r['port'], r['sensor'])]['title'],
+                                     text=f"{r['port']}  s{r['sensor']}    {r['hz']:.1f} Hz    near {near}")
+            canvas.itemconfigure(status, text=f"{len(panels)} sensor(s) on {_where(args)}    colour 0-{state['max_mm']:.0f} mm"
+                                              f"    keys: n numbers, +/- range, q quit")
+        if args.seconds and now - meter.t0 > args.seconds:
+            return finish()
+        root.after(5, tick)
+
+    def redraw_all():
+        for p in panels.values():
+            p['idx'] = [None] * ZONES
+            p['txt'] = [None] * ZONES
+        for k in panels:
+            draw_panel(k)
+
+    def key(e):
+        if e.keysym in ('q', 'Escape'):
+            finish()
+        elif e.keysym == 'n':
+            state['numbers'] = not state['numbers']; redraw_all()
+        elif e.keysym in ('plus', 'equal', 'KP_Add'):
+            state['max_mm'] *= 1.5; redraw_all()
+        elif e.keysym in ('minus', 'KP_Subtract'):
+            state['max_mm'] = max(100.0, state['max_mm'] / 1.5); redraw_all()
+
+    def finish():
+        meter.report('live')
+        root.destroy()
+
+    root.bind('<Key>', key)
+    root.protocol('WM_DELETE_WINDOW', finish)
+    root.after(5, tick)
+    root.mainloop()
     return 0
 
 
@@ -810,6 +1016,14 @@ def main(argv=None):
     p.add_argument('--seconds', type=float, help='close after N s')
     p.add_argument('--save', metavar='PNG', help='headless: run --seconds (default 5), save a snapshot, exit')
     p.set_defaults(fn=cmd_view)
+
+    p = sub.add_parser('live', help='light, fast live view (Tk; nothing to install)'); rx(p)
+    p.add_argument('--max-mm', type=float, default=1000, help='colour scale top (mm); +/- keys change it')
+    p.add_argument('--cols', type=int, default=4)
+    p.add_argument('--cell', type=int, default=36, help='zone size in pixels')
+    p.add_argument('--numbers', action='store_true', help='start with mm shown in each zone (n toggles)')
+    p.add_argument('--seconds', type=float, help='close after N s')
+    p.set_defaults(fn=cmd_live)
 
     p = sub.add_parser('record', help='save frames to .npz'); rx(p)
     p.add_argument('out')

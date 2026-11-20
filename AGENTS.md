@@ -151,7 +151,7 @@ recording leaves sensors ungrouped.
 ## Step 7: Visualise / record
 
 ```bash
-python tools/tof.py view --ports <DEST_PORT>            # user-facing live window
+python tools/tof.py live --ports <DEST_PORT>            # user-facing live window (fast; or --serial <PORT>)
 python tools/tof.py view --ports <DEST_PORT> --save shot.png --seconds 5   # for you
 python tools/tof.py record session.npz --ports <DEST_PORT> --seconds 60
 ```
@@ -177,4 +177,4 @@ python tools/tof.py record session.npz --ports <DEST_PORT> --seconds 60
 - [ ] `status --json` shows every sensor at ≥ 8 Hz
 - [ ] `timing` report and figure shared with the user
 - [ ] Sensor index ↔ physical position recorded (Step 5)
-- [ ] The user has seen `tof.py view`
+- [ ] The user has seen `tof.py live`

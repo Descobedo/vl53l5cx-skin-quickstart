@@ -88,8 +88,9 @@ ESP32-C6            mux (0x70)              sensors
 pip install -r requirements.txt
 
 python tools/tof.py status            # text: rate, nearest distance, % invalid zones per sensor
-python tools/tof.py view              # live heatmaps (near = red, grey = no target)
-python tools/tof.py view --numbers    # with the mm value in each zone
+python tools/tof.py live              # fast live view (dark = near, grey = no target)
+python tools/tof.py live --numbers    # with the mm value in each zone (n toggles, +/- colour range)
+python tools/tof.py view              # the same in matplotlib, slower (and --save for a PNG)
 python tools/tof.py record run1.npz --seconds 60
 python tools/tof.py timing --seconds 20 --save timing.png   # data over time + sampling report
 
@@ -105,6 +106,13 @@ terminal:
 ```bash
 python tools/tof.py fake --sensors 4 --port 5005
 ```
+
+**Which viewer?** `live` draws with plain Tkinter (ships with Python) and
+repaints only the cells that changed. On the test board it managed **~40
+redraws/s with 1–3 ms lag**, numbers included. `view` uses matplotlib:
+about 10 redraws/s and ~80 ms lag, and about 1 redraw/s with `--numbers`,
+because matplotlib redraws every label each time. Use `view` when you want
+`--save` snapshots.
 
 ## 5. Data over time and sampling rate
 
