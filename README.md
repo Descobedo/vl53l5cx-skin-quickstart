@@ -261,6 +261,10 @@ forward-facing sensors picks the note (pentatonic, so it always sounds fine).
 Sensors that see a surface in most zones, like one facing a table, are ignored
 automatically. Name the forward sensors yourself with `--sensors 0 1 2`. Keys:
 `c` recalibrate, `f` flip pitch direction, `q` quit.
+Tuning: `--far-mm` (default 250) is where sound starts, `--x-range 0.15 0.85` is
+the part of the side-to-side field that spans all the notes, and `--smooth`,
+`--glide` and `--fade` (seconds) set how smoothly position, pitch and volume
+follow your hand.
 
 ## 7. Troubleshooting
 

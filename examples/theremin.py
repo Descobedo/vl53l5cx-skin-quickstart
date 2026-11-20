@@ -47,7 +47,7 @@ class Synth:
     """A sine with a little 2nd/3rd harmonic. Pitch glides and volume ramps per sample,
     so changes never click."""
 
-    def __init__(self, glide_s=0.04, fade_s=0.03):
+    def __init__(self, glide_s=0.12, fade_s=0.12):
         self.freq = self.target_freq = 261.63
         self.amp = self.target_amp = 0.0
         self.phase = 0.0
@@ -171,7 +171,13 @@ def main():
     ap.add_argument('--sensors', type=int, nargs='*', help='forward sensors, left to right (default: auto)')
     ap.add_argument('--flip', action='store_true', help='reverse the pitch direction')
     ap.add_argument('--near-mm', type=float, default=40, help='full volume at this distance')
-    ap.add_argument('--far-mm', type=float, default=450, help='silent beyond this distance')
+    ap.add_argument('--far-mm', type=float, default=250, help='silent beyond this distance (start playing inside it)')
+    ap.add_argument('--x-range', type=float, nargs=2, default=[0.15, 0.85], metavar=('LO', 'HI'),
+                    help='part of the side-to-side field (0..1) that spans all the notes; '
+                         'narrower = the end notes are easier to reach')
+    ap.add_argument('--smooth', type=float, default=0.15, help='seconds of smoothing on hand position and distance')
+    ap.add_argument('--glide', type=float, default=0.12, help='seconds to glide between notes')
+    ap.add_argument('--fade', type=float, default=0.12, help='seconds for volume changes')
     ap.add_argument('--root', default='C4', help='lowest note, e.g. C4, A3')
     ap.add_argument('--octaves', type=int, default=2)
     ap.add_argument('--scale', choices=sorted(SCALES), default='pentatonic')
@@ -189,10 +195,11 @@ def main():
     root_midi = 12 * (int(name[-1]) + 1) + NOTE_NAMES.index(name[:-1])
     notes = scale_notes(root_midi, args.octaves, args.scale)
 
-    synth, hand = Synth(), Hand(args)
+    synth, hand = Synth(args.glide, args.fade), Hand(args)
     gen = tof.frames(args, idle=0)
     hand.start_calibration()
-    state = dict(note=None, vol=0.0, x=None, dist=None, last_seen=0.0, x_smooth=None, t0=time.monotonic())
+    state = dict(note=None, vol=0.0, x=None, dist=None, last_seen=0.0, x_smooth=None, d_smooth=None,
+                 t_upd=time.monotonic(), t0=time.monotonic())
 
     def update():
         got = tof.drain(gen)
@@ -207,9 +214,15 @@ def main():
         now = time.monotonic()
         if est is not None:
             dist, x = est
+            lo, hi = args.x_range
+            x = float(np.clip((x - lo) / (hi - lo), 0, 1))     # the inner part of the field spans all notes
+            # time-based smoothing (same feel whatever the loop rate); a returning hand starts fresh
+            fresh = state['x_smooth'] is None or now - state['last_seen'] > 0.25
+            a = 1 - math.exp(-(now - state['t_upd']) / args.smooth) if args.smooth > 0 else 1.0
+            state['x_smooth'] = x if fresh else state['x_smooth'] + a * (x - state['x_smooth'])
+            state['d_smooth'] = dist if fresh else state['d_smooth'] + a * (dist - state['d_smooth'])
+            dist = state['d_smooth']
             state['last_seen'] = now
-            xs = state['x_smooth']
-            state['x_smooth'] = x if xs is None else 0.6 * xs + 0.4 * x
             idx = min(int(state['x_smooth'] * len(notes)), len(notes) - 1)
             # hysteresis: only change note once the hand is well into the next one
             if state['note'] is not None and abs(state['x_smooth'] * len(notes) - (notes.index(state['note']) + 0.5)) < 0.7:
@@ -223,6 +236,7 @@ def main():
         elif now - state['last_seen'] > 0.25:                  # hand gone: fade out
             synth.target_amp = 0.0
             state['vol'], state['dist'] = 0.0, None
+        state['t_upd'] = now
         return True
 
     if args.headless:
