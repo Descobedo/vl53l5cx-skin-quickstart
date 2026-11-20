@@ -248,6 +248,20 @@ mixed in with plain-text log lines.
 | `sources` | (N,) str | sender IP (or serial port) |
 | `board_us`, `seq`, `has_meta` | (N,) | board clock, frame counter, whether the packet carried them |
 
+### Demo: ToF theremin
+
+```bash
+pip install sounddevice
+python examples/theremin.py --serial COM4
+```
+
+Keep your hands away for the first 2 s while it learns the background. Then
+the closer your hand, the louder, and its left-right position across the
+forward-facing sensors picks the note (pentatonic, so it always sounds fine).
+Sensors that see a surface in most zones, like one facing a table, are ignored
+automatically. Name the forward sensors yourself with `--sensors 0 1 2`. Keys:
+`c` recalibrate, `f` flip pitch direction, `q` quit.
+
 ## 7. Troubleshooting
 
 | Symptom | Fix |
@@ -268,7 +282,7 @@ mixed in with plain-text log lines.
 ```
 firmware/skin_board/   ESP32 sketch, config.example.h, build_opt.h (slims sensor reads)
 tools/tof.py           status / view / record / fake (single file)
-examples/              minimal receiver
+examples/              minimal receiver; theremin.py (hand distance = volume, position = note)
 tests/                 python tests/test_tof.py  (no hardware needed)
 AGENTS.md              step-by-step setup for AI agents
 ```

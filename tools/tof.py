@@ -983,6 +983,8 @@ def cmd_fake(args):
             cx, cy = 3.5 + 3 * math.sin(t + i), 3.5 + 3 * math.cos(0.7 * t + i)
             d2 = (rows - cy) ** 2 + (cols - cx) ** 2
             mm = np.where(d2 < 6, 150 + 40 * d2, 1500 + 50 * i).astype(np.uint16)
+            if i in args.static:                                  # e.g. a sensor facing the table
+                mm = (40 + rng.normal(0, 2, (8, 8))).astype(np.uint16)
             mm[rng.random((8, 8)) < 0.05] = NO_TARGET
             if rng.random() >= args.drop:
                 s.sendto(encode_packet(i, mm, board_us=board0 + int(t * 1e6), seq=seq[i]), (args.dest, args.port))
@@ -1046,6 +1048,8 @@ def main(argv=None):
     p.add_argument('--sensors', type=int, default=4)
     p.add_argument('--hz', type=float, default=15)
     p.add_argument('--drop', type=float, default=0.0, help='fraction of packets to drop')
+    p.add_argument('--static', type=int, nargs='*', default=[], metavar='SENSOR',
+                   help='sensors that only see a surface ~40 mm away (like one facing a table)')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--seconds', type=float)
     p.set_defaults(fn=cmd_fake)
